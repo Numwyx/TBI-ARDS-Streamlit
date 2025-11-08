@@ -1,16 +1,11 @@
 # app.py
-# TBI ARDS risk predictor with stacking (level-2 LogisticRegressionCV)
-# - Loads meta model: best_model.pkl (your meta_lr_cv.pkl renamed)
+# TBI ARDS risk predictor with stacking (Level-2 LogisticRegressionCV)
+# - Loads meta model: best_model.pkl  (rename from your meta_lr_cv.pkl)
 # - Loads level-1 models: model_*.pkl from repo root
-# - No uploads needed
-# - Clinical inputs: VP, MV (categorical 0/1) + numeric labs/vitals
-# - Explainer: exact linear logit contributions using LR coefficients
-#   (no SHAP Explainer needed; robust and fast)
+# - Inputs: VP, MV (categorical 0/1) + numeric clinical variables
+# - Outputs: final probability + Level-2 linear logit contributions (stable & fast)
 
 from pathlib import Path
-import json
-import traceback
-
 import numpy as np
 import pandas as pd
 import joblib
@@ -23,12 +18,11 @@ from sklearn.compose import ColumnTransformer
 from catboost import Pool, CatBoostClassifier
 
 # =============================
-# Basic settings
+# Page & env info
 # =============================
 st.set_page_config(page_title="TBI ARDS Risk Predictor", layout="wide")
 st.title("🧠 TBI ARDS Risk Predictor (Stacking)")
 
-# Show key versions for easy debugging
 try:
     import sklearn, lightgbm, xgboost, catboost
     st.caption(
@@ -39,7 +33,7 @@ except Exception:
     pass
 
 ROOT = Path(".")
-META_PATH = ROOT / "best_model.pkl"   # put your meta_lr_cv.pkl renamed to best_model.pkl in repo root
+META_PATH = ROOT / "best_model.pkl"   # your meta_lr_cv.pkl renamed
 
 # =============================
 # Clinical feature schema (your training set)
@@ -82,8 +76,12 @@ DISPLAY_NAME = {
     "HB": "Hemoglobin (g/L)",
 }
 
+# 明确 CatBoost 训练时的分类/数值列（按你的设定）
+CAT_COLS_FOR_CATBOOST = ["VP", "MV"]
+NUM_COLS_FOR_CATBOOST = [c for c in CLIN_ORDER if c not in CAT_COLS_FOR_CATBOOST]
+
 # =============================
-# Sidebar: inputs
+# Sidebar inputs
 # =============================
 st.sidebar.header("Input parameters")
 inputs = {}
@@ -109,11 +107,9 @@ for feat in CLIN_ORDER:
 
 go = st.sidebar.button("🔮 Predict", type="primary")
 
-# Build 1-row DF in canonical order
 def build_clin_df(d: dict) -> pd.DataFrame:
     row = {k: d[k] for k in CLIN_ORDER}
     X = pd.DataFrame([row], columns=CLIN_ORDER)
-    # category cast as int for 0/1
     for c in ["VP", "MV"]:
         if c in X.columns:
             X[c] = X[c].astype(int)
@@ -125,19 +121,15 @@ def build_clin_df(d: dict) -> pd.DataFrame:
 @st.cache_resource
 def load_meta_model():
     if not META_PATH.exists():
-        st.error("Meta model file 'best_model.pkl' not found in repository root.")
+        st.error("Meta model 'best_model.pkl' not found in repo root.")
         st.stop()
     return joblib.load(META_PATH)
 
 @st.cache_resource
 def load_level1_models():
-    """
-    Scan repo root for model_*.pkl and return {name: model}.
-    Accepts both ascii and unicode names after 'model_'.
-    """
     models = {}
     for fp in ROOT.glob("model_*.pkl"):
-        name = fp.stem[len("model_") :]  # take the part after model_
+        name = fp.stem[len("model_") :]
         try:
             m = joblib.load(fp)
             models[name] = m
@@ -148,16 +140,13 @@ def load_level1_models():
 meta_model = load_meta_model()
 level1_models = load_level1_models()
 
-# Expected level-1 feature names for meta
 exp_meta_feats = list(getattr(meta_model, "feature_names_in_", []))
 if not exp_meta_feats:
-    # Fallback to a common set if feature_names_in_ is missing
     exp_meta_feats = ["ada","cat","dt","gbm","knn","lgb","logistic","mlp","rf","svm","xgb"]
-
-st.caption("Level-2 expects level-1 features: " + ", ".join(exp_meta_feats))
+st.caption("Level-2 expects Level-1 features: " + ", ".join(exp_meta_feats))
 
 # =============================
-# Utilities for aligning inputs to model
+# Helpers
 # =============================
 def _get_feat_in(m):
     feat = getattr(m, "feature_names_in_", None)
@@ -190,7 +179,7 @@ def align_to_model_features(m, X_in: pd.DataFrame, cast_cat="auto") -> pd.DataFr
     X = X_in.copy()
     feat_in = _get_feat_in(m)
 
-    # case-insensitive rename to match training names exactly
+    # case-insensitive rename
     if feat_in is not None:
         lower_to_train = {c.lower(): c for c in feat_in}
         ren = {}
@@ -201,7 +190,6 @@ def align_to_model_features(m, X_in: pd.DataFrame, cast_cat="auto") -> pd.DataFr
         if ren:
             X = X.rename(columns=ren)
 
-    # guess category casting
     clf = m.named_steps.get("clf", None) if isinstance(m, Pipeline) else m
     is_catboost = isinstance(clf, CatBoostClassifier)
     cat_need_str = _needs_string_cats(m) if isinstance(m, Pipeline) else set()
@@ -225,14 +213,12 @@ def align_to_model_features(m, X_in: pd.DataFrame, cast_cat="auto") -> pd.DataFr
                 except Exception:
                     pass
 
-    # add missing columns with zeros and reorder
     if feat_in is not None:
         for c in feat_in:
             if c not in X.columns:
                 X[c] = 0
         X = X.reindex(columns=feat_in)
 
-    # numeric cast where possible
     for c in X.columns:
         if not pd.api.types.is_object_dtype(X[c]):
             try:
@@ -243,20 +229,37 @@ def align_to_model_features(m, X_in: pd.DataFrame, cast_cat="auto") -> pd.DataFr
 
 def run_level1_strict(m, X_raw: pd.DataFrame, name: str):
     """
-    Try predict_proba first, then decision_function, finally predict.
-    Returns (float_value, mode)
+    CatBoost: 强制 VP/MV->str，其余->float，并用 Pool(cat_features=idx)
+    其他模型：先 int 再 str 尝试
     """
-    # try int casting first, then str casting
     errors = []
+
+    # --- CatBoost exact path ---
+    try:
+        is_pipe = isinstance(m, Pipeline)
+        clf = m.named_steps.get("clf", None) if is_pipe else m
+        if isinstance(clf, CatBoostClassifier):
+            X_cb = X_raw.copy()
+            # VP/MV -> str
+            for c in CAT_COLS_FOR_CATBOOST:
+                if c in X_cb.columns:
+                    X_cb[c] = X_cb[c].astype("object").astype(str)
+            # others -> float
+            for c in NUM_COLS_FOR_CATBOOST:
+                if c in X_cb.columns:
+                    X_cb[c] = pd.to_numeric(X_cb[c], errors="coerce").astype(float)
+
+            cat_idx = [X_cb.columns.get_loc(c) for c in CAT_COLS_FOR_CATBOOST if c in X_cb.columns]
+            pool = Pool(X_cb, cat_features=cat_idx)
+            prob = clf.predict_proba(pool)[:, 1]
+            return float(prob[0]), "proba"
+    except Exception as e:
+        errors.append(("catboost", f"{type(e).__name__}: {e}", list(X_raw.columns)))
+
+    # --- Non-CatBoost or fallback ---
     for mode in ("int", "str"):
         try:
             X = align_to_model_features(m, X_raw, cast_cat=mode)
-            # CatBoost branch
-            if isinstance(m, Pipeline) and isinstance(m.named_steps.get("clf", None), CatBoostClassifier):
-                pool = Pool(X, cat_features=[i for i, col in enumerate(X.columns) if pd.api.types.is_object_dtype(X[col])])
-                p = m.named_steps["clf"].predict_proba(pool)[:, 1]
-                return float(p[0]), "proba"
-            # Normal sklearn-like
             if hasattr(m, "predict_proba"):
                 p = np.asarray(m.predict_proba(X))
                 if p.ndim == 2 and p.shape[1] >= 2:
@@ -270,21 +273,17 @@ def run_level1_strict(m, X_raw: pd.DataFrame, name: str):
         except Exception as e:
             errors.append((mode, f"{type(e).__name__}: {e}", list(X_raw.columns)))
             continue
-    msg = [f"Level-1 model '{name}' failed in both modes:"]
+
+    msg = [f"Level-1 model '{name}' failed:"]
     for m0, err, cols in errors:
         msg.append(f"  - mode={m0}, error={err}, cols={cols}")
     raise RuntimeError("\n".join(msg))
 
 def build_meta_input(level1_dict: dict, X_clin: pd.DataFrame, feature_names: list[str]):
-    """
-    Returns (X_meta 1xK, modes_used dict)
-    """
-    rec = {}
-    modes = {}
-    # ensure all required level-1 models exist
     missing = [f for f in feature_names if f not in level1_dict]
     if missing:
         raise FileNotFoundError(f"Missing level-1 model files for: {missing}")
+    rec, modes = {}, {}
     for name in feature_names:
         p, mode = run_level1_strict(level1_dict[name], X_clin, name)
         rec[name] = p
@@ -293,15 +292,13 @@ def build_meta_input(level1_dict: dict, X_clin: pd.DataFrame, feature_names: lis
     return X_meta, modes
 
 # =============================
-# Prediction and explanation
+# Predict
 # =============================
 if go:
-    # 1) build clinical row
-    X_clin_raw = build_clin_df(inputs)
+    X_clin = build_clin_df(inputs)
 
-    # 2) run all level-1 models in meta expected order
     try:
-        X_meta, l1_modes = build_meta_input(level1_models, X_clin_raw, exp_meta_feats)
+        X_meta, l1_modes = build_meta_input(level1_models, X_clin, exp_meta_feats)
     except Exception as e:
         st.error(f"Level-1 failed: {e}")
         st.stop()
@@ -309,33 +306,30 @@ if go:
     st.subheader("Level-1 outputs (probabilities fed into meta model)")
     st.dataframe(X_meta, use_container_width=True)
 
-    # 3) meta probability
+    # meta probability
     try:
         prob = float(meta_model.predict_proba(X_meta)[0, 1])
     except Exception:
-        # try decision_function
         if hasattr(meta_model, "decision_function"):
             z = float(meta_model.decision_function(X_meta)[0])
             prob = 1.0 / (1.0 + np.exp(-z))
         else:
-            # last fallback
             prob = float(meta_model.predict(X_meta)[0])
 
     st.subheader("Prediction")
     st.metric("Predicted ARDS probability", f"{prob:.1%}")
 
-    # 4) linear logit contributions for meta LR (exact and fast)
+    # Level-2 linear logit contributions
     try:
         feat_names = list(X_meta.columns)
-        coef = np.ravel(meta_model.coef_)            # shape (K,)
+        coef = np.ravel(meta_model.coef_)            # (K,)
         intercept = float(np.ravel(meta_model.intercept_)[0])
 
-        x = X_meta.iloc[0].values.astype(float)      # shape (K,)
-        # baseline: if you have OOF means saved as JSON, you can load and use them here
-        baseline = np.full_like(x, 0.5, dtype=float)
+        x = X_meta.iloc[0].values.astype(float)      # (K,)
+        baseline = np.full_like(x, 0.5, dtype=float) # use 0.5 as neutral baseline
 
         base_logit = intercept + float(np.dot(coef, baseline))
-        contrib = coef * (x - baseline)              # per-feature logit deltas
+        contrib = coef * (x - baseline)
 
         order = np.argsort(np.abs(contrib))[::-1]
         contrib_sorted = contrib[order]
@@ -354,8 +348,7 @@ if go:
         shap.plots.waterfall(expl, show=False)
         plt.tight_layout()
         st.pyplot(fig, clear_figure=True)
-
-        st.caption("Note: converting logit contributions to probability can be approximated by multiplying each bar by p·(1-p).")
+        st.caption("Note: probability-scale contributions can be approximated by multiplying each bar by p·(1-p).")
 
     except Exception as e:
         st.info(f"Linear contribution plot unavailable: {e}")
