@@ -1,4 +1,8 @@
-# app.py — TBI-ARDS Risk Predictor (Full Stacking, level-1 PKLs in repo root)
+# app.py — TBI-ARDS Risk Predictor (Full Stacking; level-1 PKLs in repo root)
+# Files in repo root:
+#   best_model.pkl
+#   model_ada.pkl, model_cat.pkl, model_dt.pkl, model_gbm.pkl, model_knn.pkl,
+#   model_lgb.pkl, model_logistic.pkl, model_mlp.pkl, model_rf.pkl, model_svm.pkl, model_xgb.pkl
 
 from pathlib import Path
 import numpy as np
@@ -11,14 +15,13 @@ import matplotlib.pyplot as plt
 st.set_page_config(page_title="TBI-ARDS Stacking Predictor", layout="wide")
 st.title("🧠 TBI-ARDS Stacking Predictor")
 
-# Files
-META_PATH = Path("best_model.pkl")   # level-2 meta model
-ROOT = Path(".")                     # level-1 PKLs live in repository root
+# ---------- Paths & names ----------
+ROOT = Path(".")
+META_PATH = ROOT / "best_model.pkl"  # level-2 model
+# the 11 level-1 feature names expected by the meta model
+META_FEATURES_DEFAULT = ["ada","cat","dt","gbm","knn","lgb","logistic","mlp","rf","svm","xgb"]
 
-# Level-1 feature names expected by the meta model
-META_FEATURES = ["ada","cat","dt","gbm","knn","lgb","logistic","mlp","rf","svm","xgb"]
-
-# Clinical inputs for the UI
+# ---------- Clinical feature schema for UI ----------
 FEATURE_SPECS = {
     "VP":         {"type": "cat", "labels": {0: "No vasopressor", 1: "Vasopressor used"}, "default": 0},
     "MV":         {"type": "cat", "labels": {0: "No mechanical ventilation", 1: "Mechanical ventilation"}, "default": 0},
@@ -37,54 +40,7 @@ FEATURE_SPECS = {
 }
 FEATURE_ORDER = list(FEATURE_SPECS.keys())
 
-DISPLAY_NAME = {
-    "VP": "Vasopressor use",
-    "MV": "Mechanical ventilation",
-    "APACHEII": "APACHE-II (score)",
-    "SOFA": "SOFA (score)",
-    "GCS": "GCS (score)",
-    "CCI": "Charlson comorbidity index",
-    "MAP": "Mean arterial pressure (mmHg)",
-    "Temp": "Temperature (°C)",
-    "RR": "Respiratory rate (/min)",
-    "Calcium": "Serum calcium (mmol/L)",
-    "Sodium": "Serum sodium (mmol/L)",
-    "Glucose": "Blood glucose (mmol/L)",
-    "Creatinine": "Creatinine (µmol/L)",
-    "HB": "Hemoglobin (g/L)",
-}
-
-# ---------- load models ----------
-@st.cache_resource
-def load_meta():
-    if not META_PATH.exists():
-        st.error("Missing meta model: best_model.pkl")
-        st.stop()
-    return joblib.load(META_PATH)
-
-@st.cache_resource
-def load_level1_models_from_root():
-    models = {}
-    missing = []
-    for name in META_FEATURES:
-        fp = ROOT / f"model_{name}.pkl"
-        if fp.exists():
-            try:
-                models[name] = joblib.load(fp)
-            except Exception as e:
-                st.warning(f"[WARN] failed to load {fp.name}: {e}")
-        else:
-            missing.append(name)
-    return models, missing
-
-meta = load_meta()
-level1_models, missing = load_level1_models_from_root()
-if missing:
-    st.error("Missing level-1 model files in repository root:\n" +
-             "\n".join([f"model_{n}.pkl" for n in missing]))
-    st.stop()
-
-# ---------- helpers ----------
+# ---------- Utilities ----------
 def expected_features(model):
     feat_in = getattr(model, "feature_names_in_", None)
     if feat_in is None and hasattr(model, "named_steps"):
@@ -111,27 +67,25 @@ def cast_categories(df, mode="int"):
     return Z
 
 def align_to_model_schema(model, X, defaults=None):
+    """Align X to training schema of a given sklearn model using its feature_names_in_ if available."""
     feat_in = expected_features(model)
     if feat_in is None:
         return X.copy()
     X2 = X.copy()
+    # case-insensitive rename
     lower_to_train = {c.lower(): c for c in feat_in}
-    rename_map = {}
+    ren = {}
     for col in X2.columns:
         tgt = lower_to_train.get(col.lower())
         if tgt and tgt != col:
-            rename_map[col] = tgt
-    if rename_map:
-        X2 = X2.rename(columns=rename_map)
-    # add missing with defaults
-    miss = [c for c in feat_in if c not in X2.columns]
-    if miss:
-        for c in miss:
-            if defaults and c in defaults:
-                X2[c] = defaults[c]
-            else:
-                # fall back to zero if no better default
-                X2[c] = 0.0
+            ren[col] = tgt
+    if ren:
+        X2 = X2.rename(columns=ren)
+    # add missing
+    missing = [c for c in feat_in if c not in X2.columns]
+    if missing:
+        for c in missing:
+            X2[c] = 0.0 if defaults is None or c not in defaults else defaults[c]
     return X2.reindex(columns=feat_in)
 
 def predict_proba_or_value(model, X):
@@ -146,31 +100,82 @@ def predict_proba_or_value(model, X):
     yhat = float(np.ravel(model.predict(X))[0])
     return yhat, "value"
 
-def run_level1(model1, X_clin):
-    # try int then str automatically
-    Xi = cast_categories(X_clin, "int")
-    Xi = align_to_model_schema(model1, Xi)
-    try:
-        p, _ = predict_proba_or_value(model1, Xi)
-        return p
-    except Exception:
-        Xs = cast_categories(X_clin, "str")
-        Xs = align_to_model_schema(model1, Xs)
-        p, _ = predict_proba_or_value(model1, Xs)
-        return p
+# ---------- Load models ----------
+@st.cache_resource
+def load_meta_model():
+    if not META_PATH.exists():
+        st.error("Missing meta model file: best_model.pkl")
+        st.stop()
+    return joblib.load(META_PATH)
 
-def build_meta_input(level1_dict, X_clin):
-    rec = {}
-    for name in META_FEATURES:
-        rec[name] = run_level1(level1_dict[name], X_clin)
-    return pd.DataFrame([[rec[c] for c in META_FEATURES]], columns=META_FEATURES)
+@st.cache_resource
+def load_level1_models_from_root(feature_names):
+    """Load model_<name>.pkl for each meta feature from the repository root."""
+    models, missing = {}, []
+    for name in feature_names:
+        fp = ROOT / f"model_{name}.pkl"
+        if fp.exists():
+            try:
+                models[name] = joblib.load(fp)   # ← 真正读取一级模型
+            except Exception as e:
+                st.error(f"Failed to load {fp.name}: {e}")
+                st.stop()
+        else:
+            missing.append(name)
+    return models, missing
 
-# ---------- sidebar ----------
+meta = load_meta_model()
+
+# Decide feature names the meta model expects
+exp_meta_feats = expected_features(meta)
+if exp_meta_feats is None:
+    exp_meta_feats = META_FEATURES_DEFAULT
+
+level1_models, missing = load_level1_models_from_root(exp_meta_feats)
+if missing:
+    st.error("Missing level-1 model files in repository root:\n" +
+             "\n".join([f"model_{n}.pkl" for n in missing]))
+    st.stop()
+
+# ---------- Strict level-1 prediction ----------
+def run_level1_strict(model1, X_clin, name):
+    """Predict with a level-1 model; try int then str categories. Fail loudly with context."""
+    errors = []
+    for mode in ("int", "str"):
+        Z = cast_categories(X_clin, mode)
+        Z = align_to_model_schema(model1, Z)
+        try:
+            p, _ = predict_proba_or_value(model1, Z)   # ← 真正调用一级模型预测
+            return float(p), mode
+        except Exception as e:
+            errors.append((mode, str(e), list(Z.columns)))
+    # both modes failed
+    msg = [f"Level-1 model '{name}' failed in both modes:"]
+    for m, err, cols in errors:
+        msg.append(f"  - mode={m}, error={err}, cols={cols}")
+    raise RuntimeError("\n".join(msg))
+
+def build_meta_input(level1_dict, X_clin, feature_names):
+    """Return (X_meta, modes_used)"""
+    rec, modes = {}, {}
+    for name in feature_names:
+        if name not in level1_dict:
+            raise FileNotFoundError(f"Missing level-1 model: model_{name}.pkl")
+        p, mode = run_level1_strict(level1_dict[name], X_clin, name)
+        rec[name] = p
+        modes[name] = mode
+    X_meta = pd.DataFrame([[rec[c] for c in feature_names]], columns=feature_names)
+    return X_meta, modes
+
+# ---------- Sidebar UI ----------
 st.sidebar.header("Patient Parameters")
 inputs = {}
-for feat in FEATURE_ORDER:
-    spec = FEATURE_SPECS[feat]
-    label = DISPLAY_NAME.get(feat, feat)
+for feat, spec in FEATURE_SPECS.items():
+    label = {
+        "MAP":"Mean arterial pressure (mmHg)",
+        "RR":"Respiratory rate (/min)",
+        "HB":"Hemoglobin (g/L)",
+    }.get(feat, feat)
     if spec["type"] == "cat":
         labels = list(spec["labels"].values())
         idx = list(spec["labels"].keys()).index(spec["default"])
@@ -178,44 +183,44 @@ for feat in FEATURE_ORDER:
         inputs[feat] = {v:k for k,v in spec["labels"].items()}[sel]
     else:
         inputs[feat] = st.sidebar.number_input(
-            label,
-            min_value=float(spec["min"]), max_value=float(spec["max"]),
+            label, min_value=float(spec["min"]), max_value=float(spec["max"]),
             value=float(spec["default"]), step=float(spec["step"])
         )
+
 go = st.sidebar.button("🔮 Predict ARDS Risk", type="primary")
 
-# ---------- main ----------
+# ---------- Main flow ----------
 if go:
     X_clin_raw = build_clinical_df(inputs)
-    X_clin = cast_categories(X_clin_raw, "int")
+    X_clin = cast_categories(X_clin_raw, "int")  # first try int; each L1 can switch to str internally
 
-    # 1) run all level-1 models on clinical inputs
-    X_meta = build_meta_input(level1_models, X_clin)
+    # 1) run all level-1 models
+    X_meta, l1_modes = build_meta_input(level1_models, X_clin, exp_meta_feats)
 
-    # 2) align to meta expected order if present
-    exp_meta = expected_features(meta)
-    if exp_meta is not None:
-        for c in exp_meta:
-            if c not in X_meta.columns:
-                X_meta[c] = 0.0
-        X_meta = X_meta.reindex(columns=exp_meta)
-    else:
-        X_meta = X_meta.reindex(columns=META_FEATURES)
+    st.subheader("Level-1 outputs (probabilities fed into meta model)")
+    st.dataframe(X_meta, use_container_width=True)
+    st.caption("Casting mode per level-1: " + ", ".join([f"{k}:{v}" for k,v in l1_modes.items()]))
 
-    # 3) predict with meta
+    # quick sanity checks
+    if np.allclose(X_meta.values, 0.0):
+        st.error("All level-1 outputs are zeros. Likely schema/dtype mismatch for level-1 pipelines.")
+    elif np.max(np.abs(X_meta.values - X_meta.values.mean())) < 1e-6:
+        st.warning("All level-1 outputs are almost identical constants. Check VP/MV dtype and preprocessing in level-1 models.")
+
+    # 2) align to meta schema if it carries feature_names_in_
+    X_meta = align_to_model_schema(meta, X_meta, defaults=None)
+
+    # 3) meta prediction
     score, kind = predict_proba_or_value(meta, X_meta)
 
-    st.subheader("Prediction")
+    st.subheader("🎯 Stacking Prediction")
     if kind == "prob":
         st.metric("Predicted ARDS probability", f"{score:.1%}")
     else:
         st.metric("Predicted output", f"{score:.4f}")
 
-    st.caption("Level-1 model probabilities used as meta features")
-    st.dataframe(X_meta, use_container_width=True)
-
     st.divider()
-    st.subheader("SHAP Explanation on Meta Model")
+    st.subheader("📊 SHAP Explanation (meta model)")
 
     shap_values = None
     base = None
@@ -235,19 +240,17 @@ if go:
                                  feature_names=list(X_meta.columns)),
                 show=False
             )
-            plt.tight_layout()
-            st.pyplot(plt.gcf(), clear_figure=True)
+            plt.tight_layout(); st.pyplot(plt.gcf(), clear_figure=True)
         except Exception:
             try:
                 shap.force_plot(base, shap_values, X_meta.iloc[0].values,
                                 feature_names=list(X_meta.columns), matplotlib=True, show=False)
-                plt.tight_layout()
-                st.pyplot(plt.gcf(), clear_figure=True)
+                plt.tight_layout(); st.pyplot(plt.gcf(), clear_figure=True)
             except Exception as e:
                 st.info(f"Could not render SHAP plot: {e}")
 
     with st.expander("Debug"):
-        st.write("Meta expects:", exp_meta if exp_meta is not None else META_FEATURES)
+        st.write("Meta expects:", exp_meta_feats)
         st.write("Loaded level-1:", sorted(level1_models.keys()))
         st.write("Clinical columns:", list(X_clin_raw.columns))
 else:
