@@ -1,7 +1,7 @@
 # app.py
 # ARDS Risk Predictor for Severe TBI Patients
-# Loads best_model.pkl from repo root; no uploads needed.
-# Features used at training time:
+# Loads best_model.pkl from repo root. No uploads needed.
+# Trained features:
 # VP, MV, APACHEII, SOFA, GCS, CCI, MAP, Temp, RR, Calcium, Sodium, Glucose, Creatinine, HB
 
 from pathlib import Path
@@ -12,13 +12,16 @@ import streamlit as st
 import shap
 import matplotlib.pyplot as plt
 
+# ----------------------------
+# Page config
+# ----------------------------
 st.set_page_config(page_title="ARDS Risk Predictor for Severe TBI Patients", layout="wide")
 st.title("🧠 ARDS Risk Predictor for Severe TBI Patients")
 
-MODEL_PATH = Path("best_model.pkl")  # your trained model here
+MODEL_PATH = Path("best_model.pkl")  # make sure this file is in the repo root
 
 # ----------------------------
-# Feature schema (matches your training list)
+# Feature schema
 # ----------------------------
 FEATURE_SPECS = {
     "VP":         {"type": "cat", "labels": {0: "No vasopressor", 1: "Vasopressor used"}, "default": 0},
@@ -68,12 +71,16 @@ def load_model():
 model = load_model()
 
 # ----------------------------
-# Align input to model's training schema
+# Align input to model schema
 # ----------------------------
 def align_to_model_features(model, X, cast_cat="int"):
     """
-    Reorder/complete/drop columns to match model.feature_names_in_.
-    - cast_cat: "int" to keep VP/MV as integers; "str" if your pipeline expects strings.
+    Align X to the model training schema:
+      1) get model.feature_names_in_ or pipeline clf.feature_names_in_
+      2) case-insensitive rename X columns to training names
+      3) reindex to training columns with fill_value=0.0
+      4) cast VP and MV type if needed
+    cast_cat: "int" or "str"
     """
     feat_in = getattr(model, "feature_names_in_", None)
     if feat_in is None and hasattr(model, "named_steps"):
@@ -83,7 +90,6 @@ def align_to_model_features(model, X, cast_cat="int"):
             feat_in = None
 
     if feat_in is None:
-        # No strict schema saved; just ensure types
         Z = X.copy()
         if cast_cat == "int":
             for c in ["VP", "MV"]:
@@ -96,18 +102,22 @@ def align_to_model_features(model, X, cast_cat="int"):
         return Z
 
     feat_in = list(feat_in)
-    lower_map = {c.lower(): c for c in X.columns}
-    aligned = {}
-    for col in feat_in:
-        if col in X.columns:
-            aligned[col] = X[col]
-        elif col.lower() in lower_map:
-            aligned[col] = X[lower_map[col.lower()]]
-        else:
-            aligned[col] = 0.0  # missing -> 0
 
-    Z = pd.DataFrame(aligned, columns=feat_in)
+    # rename by case-insensitive match
+    X2 = X.copy()
+    model_lower_to_orig = {c.lower(): c for c in feat_in}
+    rename_map = {}
+    for col in list(X2.columns):
+        tgt = model_lower_to_orig.get(col.lower())
+        if tgt is not None and tgt != col:
+            rename_map[col] = tgt
+    if rename_map:
+        X2 = X2.rename(columns=rename_map)
 
+    # align columns, add missing as 0.0, drop extras
+    Z = X2.reindex(columns=feat_in, fill_value=0.0)
+
+    # cast categoricals
     if cast_cat == "int":
         for c in ["VP", "MV"]:
             if c in Z.columns:
@@ -119,6 +129,7 @@ def align_to_model_features(model, X, cast_cat="int"):
         for c in ["VP", "MV"]:
             if c in Z.columns:
                 Z[c] = Z[c].astype("Int64").astype(str)
+
     return Z
 
 # ----------------------------
@@ -145,6 +156,9 @@ for feat in FEATURE_ORDER:
 
 predict_btn = st.sidebar.button("🔮 Predict ARDS Risk", type="primary")
 
+# ----------------------------
+# Build input and predict
+# ----------------------------
 def build_input_df(d):
     return pd.DataFrame([{k: d[k] for k in FEATURE_ORDER}], columns=FEATURE_ORDER)
 
@@ -166,12 +180,12 @@ def predict_proba_or_value(m, X):
 if predict_btn:
     X_raw = build_input_df(inputs)
 
-    # 如果你的 Pipeline 里对 VP/MV 要求字符串类别，把 cast_cat 改成 "str"
+    # If your pipeline expects string categories for VP and MV, change cast_cat to "str"
     X = align_to_model_features(model, X_raw, cast_cat="int")
 
     with st.expander("Debug: feature schema"):
         st.write("Expected by model:", list(getattr(model, "feature_names_in_", [])))
-        st.write("Provided (after alignment):", list(X.columns))
+        st.write("Provided after alignment:", list(X.columns))
 
     score, kind = predict_proba_or_value(model, X)
 
@@ -200,9 +214,12 @@ if predict_btn:
                         for k in FEATURE_ORDER}
             X_bg_raw = pd.DataFrame([defaults], columns=FEATURE_ORDER)
             X_bg = align_to_model_features(model, X_bg_raw, cast_cat="int")
+
             def _pred_func(arr):
                 df = pd.DataFrame(arr, columns=X.columns)
+                # predict each row independently to keep shapes consistent
                 return np.array([predict_proba_or_value(model, df.iloc[[i]])[0] for i in range(len(df))])
+
             kernel = shap.KernelExplainer(_pred_func, data=X_bg, link="logit")
             sv = kernel.shap_values(X, nsamples=200)
             shap_values = np.array(sv)[0] if isinstance(sv, list) else np.array(sv)
@@ -231,4 +248,4 @@ if predict_btn:
             except Exception as e:
                 st.info(f"Could not render SHAP plot: {e}")
 else:
-    st.info("Adjust the patient parameters on the left and click **Predict ARDS Risk**.")
+    st.info("Adjust the patient parameters on the left and click Predict ARDS Risk.")
