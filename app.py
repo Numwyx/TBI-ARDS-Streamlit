@@ -1,8 +1,4 @@
-# app.py
-# ARDS Risk Predictor for Severe TBI Patients
-# Loads best_model.pkl from repo root. No uploads needed.
-# Trained features:
-# VP, MV, APACHEII, SOFA, GCS, CCI, MAP, Temp, RR, Calcium, Sodium, Glucose, Creatinine, HB
+# app.py — TBI-ARDS Risk Predictor (Full Stacking, level-1 PKLs in repo root)
 
 from pathlib import Path
 import numpy as np
@@ -12,17 +8,17 @@ import streamlit as st
 import shap
 import matplotlib.pyplot as plt
 
-# ----------------------------
-# Page config
-# ----------------------------
-st.set_page_config(page_title="ARDS Risk Predictor for Severe TBI Patients", layout="wide")
-st.title("🧠 ARDS Risk Predictor for Severe TBI Patients")
+st.set_page_config(page_title="TBI-ARDS Stacking Predictor", layout="wide")
+st.title("🧠 TBI-ARDS Stacking Predictor")
 
-MODEL_PATH = Path("best_model.pkl")  # make sure this file is in the repo root
+# Files
+META_PATH = Path("best_model.pkl")   # level-2 meta model
+ROOT = Path(".")                     # level-1 PKLs live in repository root
 
-# ----------------------------
-# Feature schema
-# ----------------------------
+# Level-1 feature names expected by the meta model
+META_FEATURES = ["ada","cat","dt","gbm","knn","lgb","logistic","mlp","rf","svm","xgb"]
+
+# Clinical inputs for the UI
 FEATURE_SPECS = {
     "VP":         {"type": "cat", "labels": {0: "No vasopressor", 1: "Vasopressor used"}, "default": 0},
     "MV":         {"type": "cat", "labels": {0: "No mechanical ventilation", 1: "Mechanical ventilation"}, "default": 0},
@@ -30,14 +26,14 @@ FEATURE_SPECS = {
     "SOFA":       {"type": "num", "min": 0.0,  "max": 24.0,  "default": 6.0,  "step": 1.0},
     "GCS":        {"type": "num", "min": 3.0,  "max": 15.0,  "default": 10.0, "step": 1.0},
     "CCI":        {"type": "num", "min": 0.0,  "max": 20.0,  "default": 2.0,  "step": 1.0},
-    "MAP":        {"type": "num", "min": 30.0, "max": 200.0, "default": 80.0, "step": 1.0},   # mmHg
-    "Temp":       {"type": "num", "min": 30.0, "max": 43.0,  "default": 37.5, "step": 0.1},   # °C
-    "RR":         {"type": "num", "min": 5.0,  "max": 60.0,  "default": 20.0, "step": 1.0},   # /min
-    "Calcium":    {"type": "num", "min": 0.5,  "max": 3.0,   "default": 2.2,  "step": 0.1},   # mmol/L
-    "Sodium":     {"type": "num", "min": 110.0,"max": 170.0, "default": 138.0,"step": 1.0},   # mmol/L
-    "Glucose":    {"type": "num", "min": 2.0,  "max": 33.0,  "default": 8.5,  "step": 0.1},   # mmol/L
-    "Creatinine": {"type": "num", "min": 20.0, "max": 1200.0,"default": 90.0, "step": 5.0},   # µmol/L
-    "HB":         {"type": "num", "min": 40.0, "max": 200.0, "default": 120.0,"step": 1.0},   # g/L
+    "MAP":        {"type": "num", "min": 30.0, "max": 200.0, "default": 80.0, "step": 1.0},
+    "Temp":       {"type": "num", "min": 30.0, "max": 43.0,  "default": 37.5, "step": 0.1},
+    "RR":         {"type": "num", "min": 5.0,  "max": 60.0,  "default": 20.0, "step": 1.0},
+    "Calcium":    {"type": "num", "min": 0.5,  "max": 3.0,   "default": 2.2,  "step": 0.1},
+    "Sodium":     {"type": "num", "min": 110.0,"max": 170.0, "default": 138.0,"step": 1.0},
+    "Glucose":    {"type": "num", "min": 2.0,  "max": 33.0,  "default": 8.5,  "step": 0.1},
+    "Creatinine": {"type": "num", "min": 20.0, "max": 1200.0,"default": 90.0, "step": 5.0},
+    "HB":         {"type": "num", "min": 40.0, "max": 200.0, "default": 120.0,"step": 1.0},
 }
 FEATURE_ORDER = list(FEATURE_SPECS.keys())
 
@@ -58,194 +54,201 @@ DISPLAY_NAME = {
     "HB": "Hemoglobin (g/L)",
 }
 
-# ----------------------------
-# Load model
-# ----------------------------
+# ---------- load models ----------
 @st.cache_resource
-def load_model():
-    if not MODEL_PATH.exists():
-        st.error("Model file 'best_model.pkl' not found in repository root.")
+def load_meta():
+    if not META_PATH.exists():
+        st.error("Missing meta model: best_model.pkl")
         st.stop()
-    return joblib.load(MODEL_PATH)
+    return joblib.load(META_PATH)
 
-model = load_model()
+@st.cache_resource
+def load_level1_models_from_root():
+    models = {}
+    missing = []
+    for name in META_FEATURES:
+        fp = ROOT / f"model_{name}.pkl"
+        if fp.exists():
+            try:
+                models[name] = joblib.load(fp)
+            except Exception as e:
+                st.warning(f"[WARN] failed to load {fp.name}: {e}")
+        else:
+            missing.append(name)
+    return models, missing
 
-# ----------------------------
-# Align input to model schema
-# ----------------------------
-def align_to_model_features(model, X, cast_cat="int"):
-    """
-    Align X to the model training schema:
-      1) get model.feature_names_in_ or pipeline clf.feature_names_in_
-      2) case-insensitive rename X columns to training names
-      3) reindex to training columns with fill_value=0.0
-      4) cast VP and MV type if needed
-    cast_cat: "int" or "str"
-    """
+meta = load_meta()
+level1_models, missing = load_level1_models_from_root()
+if missing:
+    st.error("Missing level-1 model files in repository root:\n" +
+             "\n".join([f"model_{n}.pkl" for n in missing]))
+    st.stop()
+
+# ---------- helpers ----------
+def expected_features(model):
     feat_in = getattr(model, "feature_names_in_", None)
     if feat_in is None and hasattr(model, "named_steps"):
         try:
             feat_in = getattr(model.named_steps.get("clf", None), "feature_names_in_", None)
         except Exception:
             feat_in = None
+    return list(feat_in) if feat_in is not None else None
 
+def build_clinical_df(d):
+    return pd.DataFrame([{k: d[k] for k in FEATURE_ORDER}], columns=FEATURE_ORDER)
+
+def cast_categories(df, mode="int"):
+    Z = df.copy()
+    if mode == "int":
+        for c in ["VP","MV"]:
+            if c in Z.columns:
+                try: Z[c] = Z[c].astype(int)
+                except Exception: pass
+    else:
+        for c in ["VP","MV"]:
+            if c in Z.columns:
+                Z[c] = Z[c].astype("Int64").astype(str)
+    return Z
+
+def align_to_model_schema(model, X, defaults=None):
+    feat_in = expected_features(model)
     if feat_in is None:
-        Z = X.copy()
-        if cast_cat == "int":
-            for c in ["VP", "MV"]:
-                if c in Z.columns:
-                    Z[c] = Z[c].astype(int)
-        else:
-            for c in ["VP", "MV"]:
-                if c in Z.columns:
-                    Z[c] = Z[c].astype("Int64").astype(str)
-        return Z
-
-    feat_in = list(feat_in)
-
-    # rename by case-insensitive match
+        return X.copy()
     X2 = X.copy()
-    model_lower_to_orig = {c.lower(): c for c in feat_in}
+    lower_to_train = {c.lower(): c for c in feat_in}
     rename_map = {}
-    for col in list(X2.columns):
-        tgt = model_lower_to_orig.get(col.lower())
-        if tgt is not None and tgt != col:
+    for col in X2.columns:
+        tgt = lower_to_train.get(col.lower())
+        if tgt and tgt != col:
             rename_map[col] = tgt
     if rename_map:
         X2 = X2.rename(columns=rename_map)
+    # add missing with defaults
+    miss = [c for c in feat_in if c not in X2.columns]
+    if miss:
+        for c in miss:
+            if defaults and c in defaults:
+                X2[c] = defaults[c]
+            else:
+                # fall back to zero if no better default
+                X2[c] = 0.0
+    return X2.reindex(columns=feat_in)
 
-    # align columns, add missing as 0.0, drop extras
-    Z = X2.reindex(columns=feat_in, fill_value=0.0)
+def predict_proba_or_value(model, X):
+    if hasattr(model, "predict_proba"):
+        p = np.asarray(model.predict_proba(X))
+        if p.ndim == 2 and p.shape[1] >= 2:
+            return float(p[0,1]), "prob"
+    if hasattr(model, "decision_function"):
+        z = float(np.ravel(model.decision_function(X))[0])
+        p = 1.0/(1.0+np.exp(-z))
+        return float(p), "prob"
+    yhat = float(np.ravel(model.predict(X))[0])
+    return yhat, "value"
 
-    # cast categoricals
-    if cast_cat == "int":
-        for c in ["VP", "MV"]:
-            if c in Z.columns:
-                try:
-                    Z[c] = Z[c].astype(int)
-                except Exception:
-                    pass
-    else:
-        for c in ["VP", "MV"]:
-            if c in Z.columns:
-                Z[c] = Z[c].astype("Int64").astype(str)
+def run_level1(model1, X_clin):
+    # try int then str automatically
+    Xi = cast_categories(X_clin, "int")
+    Xi = align_to_model_schema(model1, Xi)
+    try:
+        p, _ = predict_proba_or_value(model1, Xi)
+        return p
+    except Exception:
+        Xs = cast_categories(X_clin, "str")
+        Xs = align_to_model_schema(model1, Xs)
+        p, _ = predict_proba_or_value(model1, Xs)
+        return p
 
-    return Z
+def build_meta_input(level1_dict, X_clin):
+    rec = {}
+    for name in META_FEATURES:
+        rec[name] = run_level1(level1_dict[name], X_clin)
+    return pd.DataFrame([[rec[c] for c in META_FEATURES]], columns=META_FEATURES)
 
-# ----------------------------
-# Sidebar inputs
-# ----------------------------
-st.sidebar.header("🩺 Patient Parameters")
+# ---------- sidebar ----------
+st.sidebar.header("Patient Parameters")
 inputs = {}
 for feat in FEATURE_ORDER:
     spec = FEATURE_SPECS[feat]
     label = DISPLAY_NAME.get(feat, feat)
     if spec["type"] == "cat":
         labels = list(spec["labels"].values())
-        default_idx = list(spec["labels"].keys()).index(spec["default"])
-        sel = st.sidebar.selectbox(label, labels, index=default_idx)
-        inputs[feat] = {v: k for k, v in spec["labels"].items()}[sel]
+        idx = list(spec["labels"].keys()).index(spec["default"])
+        sel = st.sidebar.selectbox(label, labels, index=idx)
+        inputs[feat] = {v:k for k,v in spec["labels"].items()}[sel]
     else:
         inputs[feat] = st.sidebar.number_input(
             label,
-            min_value=float(spec["min"]),
-            max_value=float(spec["max"]),
-            value=float(spec["default"]),
-            step=float(spec["step"]),
+            min_value=float(spec["min"]), max_value=float(spec["max"]),
+            value=float(spec["default"]), step=float(spec["step"])
         )
+go = st.sidebar.button("🔮 Predict ARDS Risk", type="primary")
 
-predict_btn = st.sidebar.button("🔮 Predict ARDS Risk", type="primary")
+# ---------- main ----------
+if go:
+    X_clin_raw = build_clinical_df(inputs)
+    X_clin = cast_categories(X_clin_raw, "int")
 
-# ----------------------------
-# Build input and predict
-# ----------------------------
-def build_input_df(d):
-    return pd.DataFrame([{k: d[k] for k in FEATURE_ORDER}], columns=FEATURE_ORDER)
+    # 1) run all level-1 models on clinical inputs
+    X_meta = build_meta_input(level1_models, X_clin)
 
-def predict_proba_or_value(m, X):
-    if hasattr(m, "predict_proba"):
-        p = np.asarray(m.predict_proba(X))
-        if p.ndim == 2 and p.shape[1] >= 2:
-            return float(p[0, 1]), "prob"
-    if hasattr(m, "decision_function"):
-        z = float(np.ravel(m.decision_function(X))[0])
-        p = 1.0 / (1.0 + np.exp(-z))
-        return float(p), "prob"
-    yhat = float(np.ravel(m.predict(X))[0])
-    return yhat, "value"
+    # 2) align to meta expected order if present
+    exp_meta = expected_features(meta)
+    if exp_meta is not None:
+        for c in exp_meta:
+            if c not in X_meta.columns:
+                X_meta[c] = 0.0
+        X_meta = X_meta.reindex(columns=exp_meta)
+    else:
+        X_meta = X_meta.reindex(columns=META_FEATURES)
 
-# ----------------------------
-# Main
-# ----------------------------
-if predict_btn:
-    X_raw = build_input_df(inputs)
+    # 3) predict with meta
+    score, kind = predict_proba_or_value(meta, X_meta)
 
-    # If your pipeline expects string categories for VP and MV, change cast_cat to "str"
-    X = align_to_model_features(model, X_raw, cast_cat="int")
-
-    with st.expander("Debug: feature schema"):
-        st.write("Expected by model:", list(getattr(model, "feature_names_in_", [])))
-        st.write("Provided after alignment:", list(X.columns))
-
-    score, kind = predict_proba_or_value(model, X)
-
-    st.subheader("🎯 Prediction")
+    st.subheader("Prediction")
     if kind == "prob":
         st.metric("Predicted ARDS probability", f"{score:.1%}")
     else:
         st.metric("Predicted output", f"{score:.4f}")
 
-    st.caption("Input summary")
-    st.dataframe(X_raw, use_container_width=True)
+    st.caption("Level-1 model probabilities used as meta features")
+    st.dataframe(X_meta, use_container_width=True)
 
     st.divider()
-    st.subheader("📊 SHAP Explanation")
+    st.subheader("SHAP Explanation on Meta Model")
 
     shap_values = None
-    base_value = None
+    base = None
     try:
-        expl = shap.Explainer(model)
-        sv = expl(X)
-        base_value = float(np.ravel(sv.base_values)[0])
+        expl = shap.Explainer(meta)
+        sv = expl(X_meta)
+        base = float(np.ravel(sv.base_values)[0])
         shap_values = np.ravel(sv.values)
-    except Exception:
-        try:
-            defaults = {k: v["default"] if FEATURE_SPECS[k]["type"] == "num" else FEATURE_SPECS[k]["default"]
-                        for k in FEATURE_ORDER}
-            X_bg_raw = pd.DataFrame([defaults], columns=FEATURE_ORDER)
-            X_bg = align_to_model_features(model, X_bg_raw, cast_cat="int")
-
-            def _pred_func(arr):
-                df = pd.DataFrame(arr, columns=X.columns)
-                # predict each row independently to keep shapes consistent
-                return np.array([predict_proba_or_value(model, df.iloc[[i]])[0] for i in range(len(df))])
-
-            kernel = shap.KernelExplainer(_pred_func, data=X_bg, link="logit")
-            sv = kernel.shap_values(X, nsamples=200)
-            shap_values = np.array(sv)[0] if isinstance(sv, list) else np.array(sv)
-            base_prob = predict_proba_or_value(model, X_bg)[0]
-            eps = 1e-12
-            base_value = np.log(np.clip(base_prob, eps, 1 - eps) / np.clip(1 - base_prob, eps, 1 - eps))
-        except Exception as e:
-            st.warning(f"SHAP explanation unavailable: {e}")
-            shap_values = None
+    except Exception as e:
+        st.info(f"SHAP not available: {e}")
 
     if shap_values is not None:
         try:
             shap.plots.waterfall(
-                shap.Explanation(values=shap_values, base_values=base_value,
-                                 data=X.iloc[0].values, feature_names=list(X.columns)),
+                shap.Explanation(values=shap_values, base_values=base,
+                                 data=X_meta.iloc[0].values,
+                                 feature_names=list(X_meta.columns)),
                 show=False
             )
             plt.tight_layout()
             st.pyplot(plt.gcf(), clear_figure=True)
         except Exception:
             try:
-                shap.force_plot(base_value, shap_values, X.iloc[0].values,
-                                feature_names=list(X.columns), matplotlib=True, show=False)
+                shap.force_plot(base, shap_values, X_meta.iloc[0].values,
+                                feature_names=list(X_meta.columns), matplotlib=True, show=False)
                 plt.tight_layout()
                 st.pyplot(plt.gcf(), clear_figure=True)
             except Exception as e:
                 st.info(f"Could not render SHAP plot: {e}")
+
+    with st.expander("Debug"):
+        st.write("Meta expects:", exp_meta if exp_meta is not None else META_FEATURES)
+        st.write("Loaded level-1:", sorted(level1_models.keys()))
+        st.write("Clinical columns:", list(X_clin_raw.columns))
 else:
-    st.info("Adjust the patient parameters on the left and click Predict ARDS Risk.")
+    st.info("Set patient parameters on the left and click Predict ARDS Risk.")
