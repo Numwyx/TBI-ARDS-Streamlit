@@ -60,20 +60,20 @@ CLIN_SPECS = {
 CLIN_ORDER = list(CLIN_SPECS.keys())
 
 DISPLAY_NAME = {
-    "VP": "Vasopressor use",
-    "MV": "Mechanical ventilation",
+    "VP": "Vasopressor Use",
+    "MV": "Mechanical Ventilation",
     "APACHEII": "APACHE-II (score)",
     "SOFA": "SOFA (score)",
     "GCS": "GCS (score)",
-    "CCI": "Charlson comorbidity index",
-    "MAP": "Mean arterial pressure (mmHg)",
+    "CCI": "Charlson Comorbidity Index",
+    "MAP": "Mean Arterial Pressure (mmHg)",
     "Temp": "Temperature (°C)",
-    "RR": "Respiratory rate (/min)",
+    "RR": "Respiratory Rate (Breath/min)",
     "Calcium": "Calcium (mmol/L)",
     "Sodium": "Sodium (mmol/L)",
-    "Glucose": "Glucose (mmol/L)",
-    "Creatinine": "Creatinine (µmol/L)",
-    "HB": "Hemoglobin (g/L)",
+    "Glucose": "Glucose (mg/dL)",
+    "Creatinine": "Creatinine (mg/dL)",
+    "HB": "Hemoglobin (g/dL)",
 }
 
 # 明确 CatBoost 训练时的分类/数值列（按你的设定）
